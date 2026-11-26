@@ -23,7 +23,7 @@ Architecture
 Threads
 -------
 1. **YOLO thread** — runs non-stop, grabs frames, detects obstacles,
-   pushes alerts into the speech queue.  NEVER paused.
+   runs pothole detection, pushes alerts into the speech queue.
 2. **VQA thread** — listens for wake-word "hello", records a question,
    grabs one frame, calls vision LLM, speaks the answer.
 3. **TTS thread** — drains the speech queue; YOLO alerts are
@@ -32,10 +32,9 @@ Threads
 
 Camera sharing
 --------------
-A single `SharedCamera` instance wraps OpenCV `VideoCapture`.
-A `threading.Lock` serialises `read()` calls so YOLO and VQA never
-collide.  YOLO continuously grabs frames; VQA only grabs one when it
-needs to send a picture to the LLM.
+A single `SharedCamera` instance wraps an ESP32-CAM MJPEG stream via
+OpenCV VideoCapture.  A background thread keeps the buffer drained so
+YOLO and VQA always get the freshest frame.
 """
 
 from __future__ import annotations
@@ -96,31 +95,20 @@ except ImportError:
 # ╠══════════════════════════════════════════════════════════╣
 
 # ── Camera ────────────────────────────────────────────────
-CAMERA_INDICES_TO_TRY: list[int] = [0, 1, 2, 3]
-CAMERA_BACKENDS_TO_TRY: list[int] = [
-    cv2.CAP_V4L2,     # Linux Video4Linux2 — most reliable on RPi
-    cv2.CAP_ANY,       # Auto-detect
-]
-CAMERA_WIDTH: int = 640          # Capture resolution
+CAMERA_WIDTH: int = 640
 CAMERA_HEIGHT: int = 480
-CAMERA_FPS: int = 15             # Target FPS for USB cams
-CAMERA_WARMUP_FRAMES: int = 5   # Discard first N frames (auto-exposure)
-CAMERA_RETRY_INTERVAL: float = 3.0   # seconds between reconnect attempts
-CAMERA_MAX_RETRIES: int = 10
 
 # ── YOLO Obstacle Detection ──────────────────────────────
-YOLO_MODEL_NAME: str = "yolov8n.pt"  # YOLOv8-nano — fastest for RPi4
-YOLO_PROCESS_WIDTH: int = 320        # Inference resolution (speed ↔ accuracy)
+YOLO_MODEL_NAME: str = "yolov8n.pt"
+YOLO_PROCESS_WIDTH: int = 320
 YOLO_PROCESS_HEIGHT: int = 240
 YOLO_CONFIDENCE: float = 0.40
 YOLO_IOU_THRESHOLD: float = 0.45
-YOLO_FRAME_INTERVAL: float = 0.25   # seconds between detections (4 FPS)
-YOLO_ALERT_COOLDOWN: float = 5.0    # seconds before re-announcing same object
-YOLO_CLOSE_DISTANCE_M: float = 1.5  # "very close" threshold
-YOLO_MEDIUM_DISTANCE_M: float = 3.0 # "nearby" threshold
+YOLO_FRAME_INTERVAL: float = 0.25
+YOLO_ALERT_COOLDOWN: float = 5.0
+YOLO_CLOSE_DISTANCE_M: float = 1.5
+YOLO_MEDIUM_DISTANCE_M: float = 3.0
 
-# Critical object classes (COCO) that matter for navigation safety.
-# Maps COCO class-id → human-readable name used in speech.
 CRITICAL_CLASSES: dict[int, str] = {
     0: "person",   1: "bicycle",   2: "car",       3: "motorcycle",
     5: "bus",      7: "truck",     9: "traffic light", 10: "fire hydrant",
@@ -130,8 +118,7 @@ CRITICAL_CLASSES: dict[int, str] = {
     73: "book",    74: "clock",    24: "backpack",  25: "umbrella",
     28: "suitcase",
 }
-# Estimated real-world widths (metres) for monocular distance estimation.
-# Used with pinhole-camera formula: distance ≈ (real_width * focal) / pixel_width
+
 OBJECT_REAL_WIDTHS_M: dict[str, float] = {
     "person": 0.5,    "bicycle": 0.6,  "car": 1.8,     "motorcycle": 0.8,
     "bus": 2.5,       "truck": 2.5,    "traffic light": 0.3, "fire hydrant": 0.3,
@@ -141,33 +128,45 @@ OBJECT_REAL_WIDTHS_M: dict[str, float] = {
     "book": 0.2,      "clock": 0.3,    "backpack": 0.4, "umbrella": 1.0,
     "suitcase": 0.5,
 }
-# Focal length estimate (pixels) at YOLO_PROCESS_WIDTH for a typical USB cam
-# with ~60° horizontal FOV.  Recalibrate if you know your camera's FOV.
+
 ESTIMATED_FOCAL_PX: float = YOLO_PROCESS_WIDTH / (2.0 * np.tan(np.radians(30)))
+
+# ── Pothole Detection ─────────────────────────────────────
+# Fraction of frame height from the top to start the ground-plane crop.
+# 0.6 = analyse the bottom 40% of the frame (the ground ahead).
+POTHOLE_GROUND_CROP_RATIO: float = 0.60
+
+# Laplacian energy ratio (lower_strip / upper_strip) above which a
+# surface hazard is announced.  Tune on your camera / surface.
+POTHOLE_RATIO_THRESHOLD: float = 1.8   # conservative — raise to reduce false positives
+POTHOLE_HIGH_RATIO: float = 2.8        # above this → "Warning!" instead of "Caution."
+
+# Seconds before the same column (left/centre/right) can be announced again.
+POTHOLE_ALERT_COOLDOWN: float = 6.0
 
 # ── Vision LLM (VQA) ─────────────────────────────────────
 LLM_API_URL: str = "https://openrouter.ai/api/v1/chat/completions"
-LLM_API_KEY_ENV: str = "OPENROUTER_API_KEY"   # env-var name
-LLM_MODEL: str = "google/gemini-flash-1.5"    # fast + cheap
+LLM_API_KEY_ENV: str = "OPENROUTER_API_KEY"
+LLM_MODEL: str = "openai/gpt-4o-mini"
 LLM_MAX_TOKENS: int = 200
 LLM_TEMPERATURE: float = 0.3
-LLM_TIMEOUT_S: int = 20                       # HTTP timeout
-LLM_IMAGE_WIDTH: int = 384                    # resize before upload
+LLM_TIMEOUT_S: int = 20
+LLM_IMAGE_WIDTH: int = 384
 LLM_IMAGE_HEIGHT: int = 288
-LLM_JPEG_QUALITY: int = 30                    # low quality → fast upload
+LLM_JPEG_QUALITY: int = 30
 
 # ── Wake-word & Speech Recognition ────────────────────────
 VOSK_MODEL_PATH: str = os.path.expanduser("~/vosk-model-small-en-us-0.15")
 WAKE_WORD: str = "hello"
-LISTEN_TIMEOUT_S: float = 7.0     # max seconds to listen for the question
-SILENCE_TIMEOUT_S: float = 2.0    # stop if silence this long after speech
+LISTEN_TIMEOUT_S: float = 7.0
+SILENCE_TIMEOUT_S: float = 2.0
 
 # ── Text-to-Speech ────────────────────────────────────────
-TTS_RATE: int = 160          # words per minute
-TTS_VOLUME: float = 1.0      # 0.0 – 1.0
+TTS_RATE: int = 160
+TTS_VOLUME: float = 1.0
 
 # ── Misc / Logging ────────────────────────────────────────
-LOG_LEVEL: str = "INFO"      # DEBUG for verbose output
+LOG_LEVEL: str = "INFO"
 LOG_FILE: Optional[str] = "smart_goggles.log"
 
 # ╚══════════════════════════════════════════════════════════╝
@@ -193,9 +192,9 @@ class Detection:
     """One detected object with spatial info."""
     label: str
     confidence: float
-    distance_m: float          # estimated monocular distance
-    clock_position: int        # 9–3 mapped to clock face
-    bbox: Tuple[int, int, int, int]  # x1, y1, x2, y2
+    distance_m: float
+    clock_position: int
+    bbox: Tuple[int, int, int, int]
 
 @dataclass(order=True)
 class SpeechItem:
@@ -206,41 +205,57 @@ class SpeechItem:
 
 
 # ════════════════════════════════════════════════════════════
-#  SHARED CAMERA
+#  SHARED CAMERA  (ESP32-CAM over Wi-Fi MJPEG stream)
 # ════════════════════════════════════════════════════════════
-class SharedCamera:
-    """Thread-safe OpenCV camera wrapper with auto-detection & recovery.
+import requests as _requests_module  # ensure available for SharedCamera
 
-    Tries every (index, backend) combination until a working camera is
-    found.  If the camera drops out later, ``read()`` returns None and
-    the background ``_recovery_loop`` re-opens it.
-    """
+class SharedCamera:
+    """Thread-safe camera wrapper for Raspberry Pi 4 to stream from ESP32-CAM."""
 
     def __init__(self) -> None:
-        self._cap: Optional[cv2.VideoCapture] = None
+        # --- UPDATE THIS IP TO YOUR ESP32 IP FROM SERIAL MONITOR ---
+        self.esp32_ip = "10.162.224.83"
+        self.stream_url = f"http://{self.esp32_ip}:81/stream"
+        # -----------------------------------------------------------
+
+        self._cap = None
         self._lock = threading.Lock()
         self._alive = True
-        self._opening = threading.Event()   # set while trying to open
-        self._recovery_thread: Optional[threading.Thread] = None
-        self._last_good_index: Optional[int] = None
-        self._last_good_backend: Optional[int] = None
-        self._open_camera()
+        self.latest_frame = None
 
-    # ── public API ────────────────────────────────────────
-    def read(self) -> Optional[np.ndarray]:
-        """Return a BGR frame or *None* if camera is unavailable."""
-        with self._lock:
+        # Background thread that constantly drains the Wi-Fi buffer
+        self._t = threading.Thread(target=self._update_loop, daemon=True,
+                                   name="CamStream")
+        self._t.start()
+        log.info("Connecting to ESP32-CAM stream at %s", self.stream_url)
+
+    def _update_loop(self) -> None:
+        """Internal loop to keep the buffer empty and capture the newest frame."""
+        while self._alive:
             if self._cap is None or not self._cap.isOpened():
-                return None
+                self._cap = cv2.VideoCapture(self.stream_url)
+                time.sleep(2)
+                continue
+
             ret, frame = self._cap.read()
-            if not ret or frame is None:
-                log.warning("Camera read failed — scheduling recovery")
-                self._schedule_recovery()
+            if ret:
+                with self._lock:
+                    self.latest_frame = frame
+            else:
+                log.warning("Stream disconnected. Retrying...")
+                self._cap.release()
+                self._cap = None
+                time.sleep(1)
+
+    def read(self) -> Optional[np.ndarray]:
+        """Returns the most recent frame captured by the background thread."""
+        with self._lock:
+            if self.latest_frame is None:
                 return None
-            return frame
+            return self.latest_frame.copy()
 
     def grab_for_llm(self) -> Optional[np.ndarray]:
-        """Convenience: read + resize for LLM upload."""
+        """Captures a frame and resizes it for the Vision LLM."""
         frame = self.read()
         if frame is None:
             return None
@@ -248,100 +263,10 @@ class SharedCamera:
                           interpolation=cv2.INTER_AREA)
 
     def release(self) -> None:
+        """Stops the thread and releases the stream."""
         self._alive = False
-        with self._lock:
-            if self._cap is not None:
-                self._cap.release()
-                self._cap = None
-        if self._recovery_thread and self._recovery_thread.is_alive():
-            self._recovery_thread.join(timeout=5)
-
-    # ── internal ──────────────────────────────────────────
-    def _open_camera(self) -> bool:
-        """Try every (index, backend) pair.  Return True on success."""
-        # If we previously found a working combo, try that first.
-        combos: list[tuple[int, int]] = []
-        if self._last_good_index is not None and self._last_good_backend is not None:
-            combos.append((self._last_good_index, self._last_good_backend))
-        for idx in CAMERA_INDICES_TO_TRY:
-            for bk in CAMERA_BACKENDS_TO_TRY:
-                if (idx, bk) not in combos:
-                    combos.append((idx, bk))
-
-        for idx, bk in combos:
-            backend_name = {cv2.CAP_V4L2: "V4L2", cv2.CAP_ANY: "ANY"}.get(bk, str(bk))
-            log.info("Trying camera index %d with backend %s …", idx, backend_name)
-            try:
-                cap = cv2.VideoCapture(idx, bk)
-                if not cap.isOpened():
-                    cap.release()
-                    continue
-
-                # Configure capture properties
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-                cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # minimize latency
-
-                # Grab a test frame
-                time.sleep(0.5)  # let auto-exposure settle
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    cap.release()
-                    continue
-
-                # Warm up — discard first few frames
-                for _ in range(CAMERA_WARMUP_FRAMES):
-                    cap.read()
-
-                with self._lock:
-                    if self._cap is not None:
-                        self._cap.release()
-                    self._cap = cap
-
-                self._last_good_index = idx
-                self._last_good_backend = bk
-                actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                log.info("✓ Camera opened: index=%d backend=%s resolution=%dx%d",
-                         idx, backend_name, actual_w, actual_h)
-                return True
-
-            except Exception:
-                log.debug("Camera index %d backend %s failed:\n%s",
-                          idx, backend_name, traceback.format_exc())
-                continue
-
-        log.error("No working camera found after trying all combinations")
-        return False
-
-    def _schedule_recovery(self) -> None:
-        """Spawn a background thread to re-open the camera (non-blocking)."""
-        if self._opening.is_set():
-            return  # already recovering
-        self._opening.set()
-        self._recovery_thread = threading.Thread(
-            target=self._recovery_loop, daemon=True, name="CameraRecovery")
-        self._recovery_thread.start()
-
-    def _recovery_loop(self) -> None:
-        """Keep trying to reopen the camera until success or shutdown."""
-        log.info("Camera recovery started")
-        with self._lock:
-            if self._cap is not None:
-                self._cap.release()
-                self._cap = None
-        for attempt in range(1, CAMERA_MAX_RETRIES + 1):
-            if not self._alive:
-                break
-            log.info("Recovery attempt %d / %d …", attempt, CAMERA_MAX_RETRIES)
-            time.sleep(CAMERA_RETRY_INTERVAL)
-            if self._open_camera():
-                log.info("Camera recovered on attempt %d", attempt)
-                break
-        else:
-            log.error("Camera recovery exhausted all retries")
-        self._opening.clear()
+        if self._cap:
+            self._cap.release()
 
 
 # ════════════════════════════════════════════════════════════
@@ -350,8 +275,8 @@ class SharedCamera:
 class AudioManager:
     """Serialises all speech output through a single background thread.
 
-    * YOLO alerts are *interruptible* — a newer alert can replace a
-      queued-but-not-yet-spoken one.
+    * YOLO / pothole alerts are *interruptible* — a newer alert can
+      replace a queued-but-not-yet-spoken one.
     * LLM answers and system messages are *not* interruptible.
     """
 
@@ -369,7 +294,6 @@ class AudioManager:
         self._init_engine()
         self._thread.start()
 
-    # ── public ────────────────────────────────────────────
     def say_system(self, text: str) -> None:
         self._enqueue(text, self.PRIORITY_SYSTEM, interruptible=False)
 
@@ -381,7 +305,6 @@ class AudioManager:
 
     def shutdown(self) -> None:
         self._alive = False
-        # Push a sentinel so the thread unblocks
         self._queue.put(SpeechItem(priority=-1, text="", interruptible=True))
         self._thread.join(timeout=5)
         with self._engine_lock:
@@ -391,9 +314,7 @@ class AudioManager:
                 except Exception:
                     pass
 
-    # ── internal ──────────────────────────────────────────
     def _init_engine(self) -> None:
-        """Initialise pyttsx3 — falls back to espeak CLI if unavailable."""
         if pyttsx3 is None:
             log.warning("pyttsx3 not installed — will use espeak CLI fallback")
             return
@@ -401,7 +322,6 @@ class AudioManager:
             engine = pyttsx3.init()
             engine.setProperty("rate", TTS_RATE)
             engine.setProperty("volume", TTS_VOLUME)
-            # Try to pick a clear English voice
             voices = engine.getProperty("voices")
             for v in voices:
                 if "english" in v.name.lower():
@@ -417,7 +337,6 @@ class AudioManager:
                                    interruptible=interruptible))
 
     def _speak(self, text: str) -> None:
-        """Speak *text* using the best available TTS backend."""
         if not text:
             return
         log.debug("TTS ▶ %s", text[:80])
@@ -429,7 +348,6 @@ class AudioManager:
                     return
                 except Exception as exc:
                     log.warning("pyttsx3 speak failed (%s), trying espeak", exc)
-        # Fallback: espeak CLI
         try:
             subprocess.run(
                 ["espeak", "-s", str(TTS_RATE), "--", text],
@@ -442,19 +360,122 @@ class AudioManager:
             log.error("espeak failed: %s", exc)
 
     def _run(self) -> None:
-        """TTS consumer loop."""
         while self._alive:
             try:
                 item = self._queue.get(timeout=0.5)
             except queue.Empty:
                 continue
             if item.priority == -1:
-                break  # sentinel
-            # If interruptible, skip if a fresher item is already queued
+                break
             if item.interruptible and not self._queue.empty():
-                log.debug("Skipping stale YOLO alert: %s", item.text[:60])
+                log.debug("Skipping stale alert: %s", item.text[:60])
                 continue
             self._speak(item.text)
+
+
+# ════════════════════════════════════════════════════════════
+#  POTHOLE DETECTOR
+# ════════════════════════════════════════════════════════════
+class PotholeDetector:
+    """Ground-plane Laplacian surface-hazard detector.
+
+    Called from ``YOLODetector._detect_once()`` on the same resized frame
+    used for YOLO inference — no extra resize overhead.
+
+    Algorithm
+    ---------
+    1. Crop the bottom (100 - POTHOLE_GROUND_CROP_RATIO*100) % of the
+       frame to isolate the ground plane directly ahead.
+    2. Convert to greyscale and compute the absolute Laplacian (edge
+       energy proxy).
+    3. Divide the crop into a 3-column × 2-row grid (left/centre/right
+       × upper-strip/lower-strip).
+    4. If lower_energy / upper_energy exceeds POTHOLE_RATIO_THRESHOLD in
+       any column, a surface hazard is announced.  The intuition is that
+       a pothole or raised kerb creates a sudden spike in edge energy
+       close to the camera compared with the smooth road further ahead.
+    """
+
+    def __init__(self, audio: AudioManager) -> None:
+        self._audio = audio
+        # Cooldown tracker: column_key → last_announcement_time
+        self._cooldowns: dict[str, float] = {}
+        log.info("PotholeDetector initialised (ground-plane Laplacian method)")
+
+    def analyze(self, frame: np.ndarray) -> None:
+        """Run pothole analysis on *frame* and announce if a hazard is detected.
+
+        Parameters
+        ----------
+        frame:
+            BGR frame at YOLO_PROCESS_WIDTH × YOLO_PROCESS_HEIGHT
+            (already resized by the YOLO thread — no extra resize needed).
+        """
+        try:
+            self._analyze_impl(frame)
+        except Exception:
+            log.debug("PotholeDetector error:\n%s", traceback.format_exc())
+
+    def _analyze_impl(self, frame: np.ndarray) -> None:
+        h, w = frame.shape[:2]
+
+        # ── 1. Crop lower portion (ground plane) ──────────
+        crop_top = int(h * POTHOLE_GROUND_CROP_RATIO)
+        ground = frame[crop_top:h, 0:w]
+        if ground.shape[0] < 10:
+            return
+
+        # ── 2. Greyscale + Laplacian ───────────────────────
+        gray = cv2.cvtColor(ground, cv2.COLOR_BGR2GRAY)
+        lap = cv2.Laplacian(gray, cv2.CV_64F)
+        lap_abs = np.abs(lap)
+
+        # ── 3. Three-column grid ───────────────────────────
+        cols = [
+            ("left",   0,           w // 3),
+            ("centre", w // 3,      2 * w // 3),
+            ("right",  2 * w // 3,  w),
+        ]
+        gh = lap_abs.shape[0]
+        mid = gh // 2
+
+        for col_name, x0, x1 in cols:
+            strip = lap_abs[:, x0:x1]
+            upper_energy = float(strip[:mid, :].mean())
+            lower_energy = float(strip[mid:, :].mean())
+
+            if upper_energy < 1e-3:
+                continue
+
+            ratio = lower_energy / upper_energy
+
+            if ratio > POTHOLE_RATIO_THRESHOLD:
+                clock = {"left": 10, "centre": 12, "right": 2}[col_name]
+                self._maybe_announce(col_name, clock, ratio)
+
+        # Prune stale cooldowns periodically
+        if len(self._cooldowns) > 50:
+            now = time.monotonic()
+            self._cooldowns = {
+                k: v for k, v in self._cooldowns.items()
+                if now - v < POTHOLE_ALERT_COOLDOWN * 2
+            }
+
+    def _maybe_announce(self, col_name: str, clock: int,
+                        ratio: float) -> None:
+        """Announce hazard if cooldown for this column has expired."""
+        now = time.monotonic()
+        key = f"pothole_{col_name}"
+        if now - self._cooldowns.get(key, 0.0) < POTHOLE_ALERT_COOLDOWN:
+            return
+        self._cooldowns[key] = now
+
+        urgency = "Warning!" if ratio > POTHOLE_HIGH_RATIO else "Caution."
+        direction = f"{clock} o'clock"
+        msg = (f"{urgency} Surface hazard ahead at {direction}. "
+               "Watch your step.")
+        log.info("Pothole alert: %s (ratio=%.2f)", msg, ratio)
+        self._audio.say_yolo(msg)
 
 
 # ════════════════════════════════════════════════════════════
@@ -464,9 +485,10 @@ class YOLODetector:
     """Continuous YOLO-based obstacle detection with monocular distance
     estimation and clock-position spatial audio alerts.
 
-    Runs in its own thread.  Grabs frames from ``SharedCamera``, resizes
-    to ``YOLO_PROCESS_WIDTH × YOLO_PROCESS_HEIGHT``, runs inference, and
-    pushes alerts into ``AudioManager``.
+    Also runs ``PotholeDetector`` on every frame at zero extra cost
+    (reuses the resized frame already produced for YOLO inference).
+
+    Runs in its own thread.
     """
 
     def __init__(self, camera: SharedCamera, audio: AudioManager) -> None:
@@ -474,8 +496,12 @@ class YOLODetector:
         self._audio = audio
         self._alive = True
         self._model: Any = None
-        # Cooldown tracker: label → last_announcement_time
         self._cooldowns: dict[str, float] = {}
+        # Pause gate: when *set* YOLO runs; when *cleared* YOLO waits.
+        self._run_gate = threading.Event()
+        self._run_gate.set()
+        # Pothole detector shares the same audio manager
+        self._pothole = PotholeDetector(audio)
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name="YOLO")
         self._load_model()
@@ -485,9 +511,19 @@ class YOLODetector:
 
     def stop(self) -> None:
         self._alive = False
+        self._run_gate.set()
         self._thread.join(timeout=10)
 
-    # ── model loading ─────────────────────────────────────
+    def pause(self) -> None:
+        """Pause detection (called by VQA when handling a query)."""
+        log.info("YOLO paused (VQA active)")
+        self._run_gate.clear()
+
+    def resume(self) -> None:
+        """Resume detection (called by VQA after query completes)."""
+        log.info("YOLO resumed")
+        self._run_gate.set()
+
     def _load_model(self) -> None:
         if YOLO is None:
             log.error("ultralytics not installed — YOLO disabled")
@@ -495,7 +531,6 @@ class YOLODetector:
         try:
             log.info("Loading YOLO model '%s' …", YOLO_MODEL_NAME)
             self._model = YOLO(YOLO_MODEL_NAME)
-            # Warm-up inference (allocates buffers)
             dummy = np.zeros((YOLO_PROCESS_HEIGHT, YOLO_PROCESS_WIDTH, 3),
                              dtype=np.uint8)
             self._model.predict(dummy, verbose=False,
@@ -507,21 +542,23 @@ class YOLODetector:
             log.error("Failed to load YOLO model: %s", exc)
             self._model = None
 
-    # ── main loop ─────────────────────────────────────────
     def _run(self) -> None:
         log.info("YOLO detection thread started")
         while self._alive:
+            self._run_gate.wait()
+            if not self._alive:
+                break
             loop_start = time.monotonic()
             try:
                 self._detect_once()
             except Exception:
                 log.error("YOLO detection error:\n%s", traceback.format_exc())
             elapsed = time.monotonic() - loop_start
-            sleep_time = max(0.01, YOLO_FRAME_INTERVAL - elapsed)
-            time.sleep(sleep_time)
+            time.sleep(max(0.01, YOLO_FRAME_INTERVAL - elapsed))
         log.info("YOLO detection thread stopped")
 
     def _detect_once(self) -> None:
+        """Grab one frame, run YOLO + pothole detection on it."""
         frame = self._camera.read()
         if frame is None:
             return
@@ -530,21 +567,21 @@ class YOLODetector:
                            (YOLO_PROCESS_WIDTH, YOLO_PROCESS_HEIGHT),
                            interpolation=cv2.INTER_AREA)
 
-        if self._model is None:
-            return
+        # ── YOLO obstacle detection ────────────────────────
+        if self._model is not None:
+            results = self._model.predict(
+                small, verbose=False,
+                conf=YOLO_CONFIDENCE,
+                iou=YOLO_IOU_THRESHOLD,
+                imgsz=YOLO_PROCESS_WIDTH,
+            )
+            detections = self._parse_results(results, small.shape[1])
+            if detections:
+                self._announce(detections)
 
-        results = self._model.predict(
-            small, verbose=False,
-            conf=YOLO_CONFIDENCE,
-            iou=YOLO_IOU_THRESHOLD,
-            imgsz=YOLO_PROCESS_WIDTH,
-        )
+        # ── Pothole detection (reuses same resized frame) ──
+        self._pothole.analyze(small)
 
-        detections = self._parse_results(results, small.shape[1])
-        if detections:
-            self._announce(detections)
-
-    # ── result parsing ────────────────────────────────────
     def _parse_results(self, results: Any,
                        frame_width: int) -> list[Detection]:
         dets: list[Detection] = []
@@ -559,21 +596,18 @@ class YOLODetector:
                 conf = float(box.conf[0])
                 x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
                 dist = self._estimate_distance(label, x2 - x1)
-                clock = self._pixel_to_clock(
-                    (x1 + x2) / 2.0, frame_width)
+                clock = self._pixel_to_clock((x1 + x2) / 2.0, frame_width)
                 dets.append(Detection(
                     label=label, confidence=conf,
                     distance_m=round(dist, 1),
                     clock_position=clock,
                     bbox=(x1, y1, x2, y2),
                 ))
-        # Sort by distance — closest first (most urgent)
         dets.sort(key=lambda d: d.distance_m)
         return dets
 
     @staticmethod
     def _estimate_distance(label: str, pixel_width: int) -> float:
-        """Monocular distance using pinhole model: D = (W_real × f) / w_px"""
         real_w = OBJECT_REAL_WIDTHS_M.get(label, 0.5)
         if pixel_width < 1:
             pixel_width = 1
@@ -581,26 +615,19 @@ class YOLODetector:
 
     @staticmethod
     def _pixel_to_clock(center_x: float, frame_width: int) -> int:
-        """Map horizontal pixel position to clock position (9–3).
-
-        9 o'clock = far left, 12 = centre, 3 = far right.
-        """
         ratio = center_x / max(frame_width, 1)
-        # Map [0, 1] → [9, 15] then wrap 13→1, 14→2, 15→3
         clock_raw = 9 + ratio * 6
         clock = int(round(clock_raw))
         if clock > 12:
             clock -= 12
         return max(1, min(12, clock))
 
-    # ── announcement logic ────────────────────────────────
     def _announce(self, detections: list[Detection]) -> None:
         now = time.monotonic()
         parts: list[str] = []
-        for d in detections[:3]:  # max 3 objects per cycle
+        for d in detections[:3]:
             key = f"{d.label}_{d.clock_position}"
-            last = self._cooldowns.get(key, 0.0)
-            if now - last < YOLO_ALERT_COOLDOWN:
+            if now - self._cooldowns.get(key, 0.0) < YOLO_ALERT_COOLDOWN:
                 continue
             self._cooldowns[key] = now
 
@@ -623,7 +650,6 @@ class YOLODetector:
             log.info("YOLO alert: %s", full)
             self._audio.say_yolo(full)
 
-        # Prune stale cooldowns every ~30 s
         if len(self._cooldowns) > 200:
             cutoff = now - YOLO_ALERT_COOLDOWN * 2
             self._cooldowns = {k: v for k, v in self._cooldowns.items()
@@ -634,23 +660,11 @@ class YOLODetector:
 #  PROMPT ENGINEERING FOR BLIND USERS
 # ════════════════════════════════════════════════════════════
 
-# System prompt shared by all query types.
 _SYSTEM_PROMPT = textwrap.dedent("""\
     You are the AI assistant of a pair of smart goggles worn by a blind person.
     You see exactly what the camera on the goggles shows.
-
-    Rules — follow these strictly:
-    1. Max three short sentences.
-    2. Always start with immediate dangers or obstacles if any.
-    3. Use clock positions for directions (12 = straight ahead).
-    4. Give distances in meters.
-    5. Be privacy-conscious — only mention people's positions and actions
-       unless specifically asked for details.
-    6. If unsure, say "I'm not sure" — never guess about safety.
-    7. Use simple, clear language — no jargon or visual metaphors.
 """)
 
-# Specialised user-prompt templates keyed by query category.
 _PROMPTS: dict[str, str] = {
     "safety": (
         "The user is worried about obstacles or safety. "
@@ -687,7 +701,6 @@ _PROMPTS: dict[str, str] = {
     ),
 }
 
-# Keyword → category mapping for automatic prompt selection.
 _CATEGORY_KEYWORDS: dict[str, list[str]] = {
     "safety": ["safe", "danger", "obstacle", "block", "hazard", "clear",
                "walk", "cross", "step", "trip", "fall", "careful",
@@ -707,7 +720,6 @@ _CATEGORY_KEYWORDS: dict[str, list[str]] = {
 
 
 def classify_query(question: str) -> str:
-    """Classify a user question into a prompt category."""
     q = question.lower()
     scores: dict[str, int] = {cat: 0 for cat in _CATEGORY_KEYWORDS}
     for cat, keywords in _CATEGORY_KEYWORDS.items():
@@ -715,9 +727,7 @@ def classify_query(question: str) -> str:
             if kw in q:
                 scores[cat] += 1
     best = max(scores, key=lambda c: scores[c])
-    if scores[best] == 0:
-        return "general"
-    return best
+    return "general" if scores[best] == 0 else best
 
 
 # ════════════════════════════════════════════════════════════
@@ -725,15 +735,14 @@ def classify_query(question: str) -> str:
 # ════════════════════════════════════════════════════════════
 class VisionAssistant:
     """Listens for wake-word → records question → calls vision LLM → speaks
-    the answer.
-
-    Runs in its own thread.  Shares the camera with YOLO via
-    ``SharedCamera``.
+    the answer.  Pauses YOLO for the duration of each query.
     """
 
-    def __init__(self, camera: SharedCamera, audio: AudioManager) -> None:
+    def __init__(self, camera: SharedCamera, audio: AudioManager,
+                 yolo: Optional["YOLODetector"] = None) -> None:
         self._camera = camera
         self._audio = audio
+        self._yolo = yolo
         self._alive = True
         self._api_key: str = os.environ.get(LLM_API_KEY_ENV, "")
         self._vosk_model: Any = None
@@ -757,7 +766,6 @@ class VisionAssistant:
             except Exception:
                 pass
 
-    # ── Vosk initialisation ───────────────────────────────
     def _init_vosk(self) -> None:
         if VoskModel is None or KaldiRecognizer is None:
             log.warning("Vosk not installed — wake-word detection disabled")
@@ -775,7 +783,6 @@ class VisionAssistant:
             self._vosk_model = None
 
     def _get_pyaudio(self) -> Any:
-        """Lazy-init PyAudio (avoids issues if ALSA isn't ready yet)."""
         if self._pa is None:
             if pyaudio is None:
                 log.error("PyAudio not installed — cannot use microphone")
@@ -787,7 +794,6 @@ class VisionAssistant:
                 return None
         return self._pa
 
-    # ── main loop ─────────────────────────────────────────
     def _run(self) -> None:
         log.info("VQA assistant thread started")
         if self._vosk_model is None:
@@ -799,7 +805,6 @@ class VisionAssistant:
             log.error("VQA thread exiting — no PyAudio")
             return
 
-        # Open microphone stream
         mic_stream: Any = None
         try:
             mic_stream = pa.open(
@@ -835,12 +840,10 @@ class VisionAssistant:
                 partial = json.loads(recognizer.PartialResult())
                 partial_text = partial.get("partial", "").lower()
                 if WAKE_WORD in partial_text:
-                    # Consume the rest of the utterance
                     self._drain_until_final(mic_stream, recognizer)
                     log.info("Wake word detected (partial match)!")
                     self._handle_query(mic_stream, recognizer)
 
-        # Cleanup
         try:
             mic_stream.stop_stream()
             mic_stream.close()
@@ -850,7 +853,6 @@ class VisionAssistant:
 
     def _drain_until_final(self, stream: Any, rec: Any,
                            timeout: float = 1.5) -> None:
-        """Read audio until Vosk produces a final result (or timeout)."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
@@ -860,41 +862,45 @@ class VisionAssistant:
             if rec.AcceptWaveform(data):
                 break
 
-    # ── query handling ────────────────────────────────────
     def _handle_query(self, mic_stream: Any, recognizer: Any) -> None:
-        """Record the user's question, query the LLM, speak the answer."""
-        self._audio.say_system("Ready for your question.")
-        log.info("Listening for question …")
+        """Record the user's question, query the LLM, speak the answer.
+        YOLO (including pothole detection) is paused for the duration.
+        """
+        if self._yolo is not None:
+            self._yolo.pause()
 
-        # Reset recognizer state
-        recognizer.Reset()
-        question = self._listen_for_question(mic_stream, recognizer)
-        if not question:
-            self._audio.say_system("Sorry, I didn't catch that. "
-                                   "Say hello again to try.")
-            return
+        try:
+            self._audio.say_system("Ready for your question.")
+            log.info("Listening for question …")
 
-        log.info("Question: '%s'", question)
-        self._audio.say_system("One moment.")
+            recognizer.Reset()
+            question = self._listen_for_question(mic_stream, recognizer)
+            if not question:
+                self._audio.say_system("Sorry, I didn't catch that. "
+                                       "Say hello again to try.")
+                return
 
-        # Grab a frame for the LLM
-        frame = self._camera.grab_for_llm()
-        if frame is None:
-            self._audio.say_system("Camera is not available right now. "
-                                   "Please try again.")
-            return
+            log.info("Question: '%s'", question)
+            self._audio.say_system("One moment.")
 
-        # Call vision LLM
-        answer = self._query_llm(question, frame)
-        if answer:
-            log.info("LLM answer: %s", answer)
-            self._audio.say_llm(answer)
-        else:
-            self._audio.say_system("Sorry, I couldn't get an answer. "
-                                   "Please try again.")
+            frame = self._camera.grab_for_llm()
+            if frame is None:
+                self._audio.say_system("Camera is not available right now. "
+                                       "Please try again.")
+                return
+
+            answer = self._query_llm(question, frame)
+            if answer:
+                log.info("LLM answer: %s", answer)
+                self._audio.say_llm(answer)
+            else:
+                self._audio.say_system("Sorry, I couldn't get an answer. "
+                                       "Please try again.")
+        finally:
+            if self._yolo is not None:
+                self._yolo.resume()
 
     def _listen_for_question(self, stream: Any, rec: Any) -> str:
-        """Record up to LISTEN_TIMEOUT_S of speech, stop on silence."""
         deadline = time.monotonic() + LISTEN_TIMEOUT_S
         heard_speech = False
         last_speech_time = time.monotonic()
@@ -919,10 +925,8 @@ class VisionAssistant:
                     heard_speech = True
                     last_speech_time = time.monotonic()
 
-            # Stop if we heard speech and then silence
             if heard_speech and (time.monotonic() - last_speech_time
                                  > SILENCE_TIMEOUT_S):
-                # Finalise
                 rec.AcceptWaveform(b"\x00\x00" * 2048)
                 final = json.loads(rec.FinalResult())
                 t = final.get("text", "").strip()
@@ -931,13 +935,10 @@ class VisionAssistant:
                 break
 
         question = " ".join(full_text_parts).strip()
-        # Remove the wake word if it got captured again
         question = re.sub(r"\bhello\b", "", question, flags=re.IGNORECASE).strip()
         return question
 
-    # ── LLM API call ──────────────────────────────────────
     def _query_llm(self, question: str, frame: np.ndarray) -> Optional[str]:
-        """Send (image, question) to OpenRouter vision LLM."""
         if not self._api_key:
             log.error("No API key — cannot call LLM")
             return None
@@ -945,19 +946,16 @@ class VisionAssistant:
             log.error("requests library not installed")
             return None
 
-        # Encode frame as small JPEG
         encode_params = [cv2.IMWRITE_JPEG_QUALITY, LLM_JPEG_QUALITY]
         ok, buf = cv2.imencode(".jpg", frame, encode_params)
         if not ok:
             log.error("JPEG encoding failed")
             return None
         b64_image = base64.b64encode(buf.tobytes()).decode("utf-8")
-        image_size_kb = len(buf) / 1024
         log.debug("Image encoded: %.1f KB (%dx%d @ Q%d)",
-                  image_size_kb, LLM_IMAGE_WIDTH, LLM_IMAGE_HEIGHT,
+                  len(buf) / 1024, LLM_IMAGE_WIDTH, LLM_IMAGE_HEIGHT,
                   LLM_JPEG_QUALITY)
 
-        # Select prompt based on question content
         category = classify_query(question)
         user_prompt = _PROMPTS[category]
         log.debug("Query category: %s", category)
@@ -971,10 +969,7 @@ class VisionAssistant:
             "max_tokens": LLM_MAX_TOKENS,
             "temperature": LLM_TEMPERATURE,
             "messages": [
-                {
-                    "role": "system",
-                    "content": _SYSTEM_PROMPT,
-                },
+                {"role": "system", "content": _SYSTEM_PROMPT},
                 {
                     "role": "user",
                     "content": [
@@ -1045,7 +1040,6 @@ class SmartGogglesController:
         self._vqa: Optional[VisionAssistant] = None
 
     def run(self) -> None:
-        """Blocking entry point — runs until Ctrl-C or fatal error."""
         log.info("=" * 55)
         log.info("  Smart Goggles System — starting up")
         log.info("=" * 55)
@@ -1070,7 +1064,6 @@ class SmartGogglesController:
             self._shutdown()
             return
 
-        # Quick test read
         test_frame = self._camera.read()
         if test_frame is None:
             self._audio.say_system("Camera connected but not responding. "
@@ -1078,18 +1071,20 @@ class SmartGogglesController:
         else:
             self._audio.say_system("Camera ready.")
 
-        # ── 3. YOLO detector ─────────────────────────────
+        # ── 3. YOLO + Pothole detector ────────────────────
         try:
             self._yolo = YOLODetector(self._camera, self._audio)
             self._yolo.start()
-            self._audio.say_system("Obstacle detection active.")
+            self._audio.say_system(
+                "Obstacle and surface hazard detection active.")
         except Exception as exc:
             log.error("YOLO init failed: %s — running without detection", exc)
             self._audio.say_system("Obstacle detection failed to start.")
 
         # ── 4. VQA assistant ──────────────────────────────
         try:
-            self._vqa = VisionAssistant(self._camera, self._audio)
+            self._vqa = VisionAssistant(self._camera, self._audio,
+                                        yolo=self._yolo)
             self._vqa.start()
             self._audio.say_system("Voice assistant ready. Say hello to ask "
                                    "a question.")
@@ -1099,7 +1094,6 @@ class SmartGogglesController:
 
         log.info("All subsystems initialised — entering main loop")
 
-        # ── 5. Main loop (just keeps the process alive) ──
         self._install_signal_handlers()
         try:
             while self._alive:
@@ -1113,7 +1107,7 @@ class SmartGogglesController:
         log.info("Shutting down …")
         if self._audio:
             self._audio.say_system("Shutting down. Goodbye.")
-            time.sleep(2)  # let TTS finish
+            time.sleep(2)
 
         self._alive = False
         if self._vqa:
@@ -1131,7 +1125,6 @@ class SmartGogglesController:
         log.info("Shutdown complete")
 
     def _install_signal_handlers(self) -> None:
-        """Handle SIGTERM gracefully (e.g. from systemd)."""
         def _handler(signum: int, frame: Any) -> None:
             log.info("Signal %d received — shutting down", signum)
             self._alive = False
@@ -1140,14 +1133,13 @@ class SmartGogglesController:
             signal.signal(signal.SIGTERM, _handler)
             signal.signal(signal.SIGINT, _handler)
         except (OSError, ValueError):
-            pass  # signals may not be settable in all contexts
+            pass
 
 
 # ════════════════════════════════════════════════════════════
 #  ENTRY POINT
 # ════════════════════════════════════════════════════════════
 def main() -> None:
-    """Launch the Smart Goggles system."""
     controller = SmartGogglesController()
     controller.run()
 
